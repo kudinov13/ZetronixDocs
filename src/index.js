@@ -503,6 +503,15 @@ function getAdminHtml() {
   .btn-sm { padding: 6px 12px; font-size: 12px; }
   .card { background: #18181b; border: 1px solid #27272a; border-radius: 12px; padding: 24px; margin-bottom: 20px; }
   .card-title { font-size: 18px; font-weight: 600; margin-bottom: 16px; color: #e4e4e7; }
+  .toolbar { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+  .search-box { flex: 1; min-width: 200px; max-width: 400px; padding: 10px 14px; background: #0f1117; border: 1px solid #3f3f46; border-radius: 8px; color: #e4e4e7; font-size: 14px; outline: none; }
+  .search-box:focus { border-color: #6366f1; }
+  .sort-select { padding: 10px 14px; background: #0f1117; border: 1px solid #3f3f46; border-radius: 8px; color: #e4e4e7; font-size: 14px; outline: none; cursor: pointer; }
+  .sort-select:focus { border-color: #6366f1; }
+  th { cursor: pointer; user-select: none; }
+  th:hover { color: #a1a1aa; }
+  th .sort-arrow { font-size: 10px; margin-left: 4px; opacity: 0.5; }
+  th.sorted .sort-arrow { opacity: 1; color: #6366f1; }
   .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   .form-group { display: flex; flex-direction: column; gap: 6px; }
   .form-group.full { grid-column: 1 / -1; }
@@ -599,6 +608,20 @@ function getAdminHtml() {
     <div class="stats" id="statsRow"></div>
     <div class="card">
       <div class="card-title">Все клиенты</div>
+      <div class="toolbar">
+        <input type="text" class="search-box" id="clientSearch" placeholder="Поиск по имени, key_id, тарифу..." oninput="renderClients()">
+        <select class="sort-select" id="clientSort" onchange="renderClients()">
+          <option value="created_desc">Сначала новые</option>
+          <option value="created_asc">Сначала старые</option>
+          <option value="customer_asc">Имя (А-Я)</option>
+          <option value="customer_desc">Имя (Я-А)</option>
+          <option value="expiry_asc">Срок: скоро истекают</option>
+          <option value="expiry_desc">Срок: долго действуют</option>
+          <option value="price_desc">Цена: дороже</option>
+          <option value="price_asc">Цена: дешевле</option>
+          <option value="ai_cost_desc">Расход ИИ: больше</option>
+        </select>
+      </div>
       <div style="overflow-x: auto;">
         <table>
           <thead>
@@ -690,6 +713,18 @@ function getAdminHtml() {
     <div class="stats" id="reportStats"></div>
     <div class="card">
       <div class="card-title">Использование по клиентам</div>
+      <div class="toolbar">
+        <input type="text" class="search-box" id="reportSearch" placeholder="Поиск по имени клиента..." oninput="renderReport()">
+        <select class="sort-select" id="reportSort" onchange="renderReport()">
+          <option value="week_cost_desc">Стоимость за неделю: больше</option>
+          <option value="week_cost_asc">Стоимость за неделю: меньше</option>
+          <option value="month_cost_desc">Стоимость за месяц: больше</option>
+          <option value="month_cost_asc">Стоимость за месяц: меньше</option>
+          <option value="week_tokens_desc">Токенов за неделю: больше</option>
+          <option value="customer_asc">Имя (А-Я)</option>
+          <option value="days_asc">Скоро истекают</option>
+        </select>
+      </div>
       <div style="overflow-x: auto;">
         <table>
           <thead>
@@ -771,6 +806,9 @@ function switchTab(tab) {
 }
 
 // ─── Load clients ─────────────────────────────────────────────────
+let allClients = []
+let allReportData = null
+
 async function loadClients() {
   try {
     const resp = await fetch('/api/admin/licenses/full', {
@@ -778,64 +816,103 @@ async function loadClients() {
     })
     if (resp.status === 401) { logout(); return }
     const data = await resp.json()
-    const licenses = data.licenses || []
-
-    // Stats
-    const total = licenses.length
-    const active = licenses.filter(l => !l.revoked && (!l.expiry_date || new Date(l.expiry_date) > new Date())).length
-    const totalRevenue = licenses.reduce((s, l) => s + parseFloat(l.price_rubles || 0), 0)
-    const totalAiCost = licenses.reduce((s, l) => s + parseFloat(l.total_ai_cost || 0), 0)
-
-    document.getElementById('statsRow').innerHTML = \`
-      <div class="stat-card"><div class="stat-label">Всего клиентов</div><div class="stat-value">\${total}</div></div>
-      <div class="stat-card"><div class="stat-label">Активных</div><div class="stat-value">\${active}</div></div>
-      <div class="stat-card"><div class="stat-label">Выручка</div><div class="stat-value">₽\${totalRevenue.toLocaleString('ru-RU')}</div></div>
-      <div class="stat-card"><div class="stat-label">Расход на ИИ</div><div class="stat-value">₽\${totalAiCost.toLocaleString('ru-RU', {maximumFractionDigits: 2})}</div></div>
-    \`
-
-    // Table
-    const typeLabels = { individual: 'ИП', small: 'Малая', large: 'Крупная' }
-    const planLabels = { trial: 'Trial', small: 'Small', large: 'Large', staff: 'Staff' }
-
-    document.getElementById('clientsTable').innerHTML = licenses.map(l => {
-      const isExpired = l.expiry_date && new Date(l.expiry_date) < new Date()
-      const isRevoked = l.revoked
-      const isActive = !isRevoked && !isExpired && (!l.expiry_date || l.unlimited || true)
-      const statusBadge = isRevoked
-        ? '<span class="badge badge-red">Отозвана</span>'
-        : isExpired
-        ? '<span class="badge badge-gray">Истекла</span>'
-        : l.unlimited
-        ? '<span class="badge badge-blue">Безлимит</span>'
-        : '<span class="badge badge-green">Активна</span>'
-
-      const expiryText = l.unlimited ? '∞' : (l.expiry_date ? new Date(l.expiry_date).toLocaleDateString('ru-RU') : '—')
-      const budget = parseFloat(l.ai_budget_rubles || 0)
-      const spent = parseFloat(l.total_ai_cost || 0)
-      const budgetText = budget > 0
-        ? \`₽\${spent.toLocaleString('ru-RU', {maximumFractionDigits:0})} / ₽\${budget.toLocaleString('ru-RU')}\`
-        : \`₽\${spent.toLocaleString('ru-RU', {maximumFractionDigits:0})}\`
-
-      return \`<tr>
-        <td><strong>\${escapeHtml(l.customer)}</strong><br><small style="color:#71717a">\${l.key_id}</small></td>
-        <td>\${typeLabels[l.customer_type] || '—'}</td>
-        <td><span class="badge badge-blue">\${planLabels[l.plan] || l.plan}</span></td>
-        <td>\${expiryText}</td>
-        <td>\${l.activations_count || 0}</td>
-        <td>₽\${parseFloat(l.price_rubles || 0).toLocaleString('ru-RU')}</td>
-        <td>\${budgetText}</td>
-        <td>\${budget > 0 ? renderProgress(spent, budget) : '—'}</td>
-        <td>\${statusBadge}</td>
-        <td class="row-actions">
-          <button class="btn btn-secondary btn-sm" onclick="showKey('\${l.key_id}')">Ключ</button>
-          \${!isRevoked && !l.unlimited ? \`<button class="btn btn-primary btn-sm" onclick="extendLicense('\${l.key_id}', '\${escapeHtml(l.customer)}')">Продлить</button>\` : ''}
-          \${!isRevoked ? \`<button class="btn btn-danger btn-sm" onclick="revokeLicense('\${l.key_id}')">Отозвать</button>\` : ''}
-        </td>
-      </tr>\`
-    }).join('') || '<tr><td colspan="10" style="text-align:center;color:#71717a;padding:40px;">Нет клиентов</td></tr>'
+    allClients = data.licenses || []
+    renderClients()
   } catch (err) {
     document.getElementById('clientsTable').innerHTML = '<tr><td colspan="10" style="color:#ef4444;">Ошибка: ' + escapeHtml(err.message) + '</td></tr>'
   }
+}
+
+function renderClients() {
+  const licenses = allClients
+  const search = (document.getElementById('clientSearch')?.value || '').toLowerCase().trim()
+  const sort = document.getElementById('clientSort')?.value || 'created_desc'
+
+  // Stats (по всем данным, без фильтра)
+  const total = licenses.length
+  const active = licenses.filter(l => !l.revoked && (!l.expiry_date || new Date(l.expiry_date) > new Date())).length
+  const totalRevenue = licenses.reduce((s, l) => s + parseFloat(l.price_rubles || 0), 0)
+  const totalAiCost = licenses.reduce((s, l) => s + parseFloat(l.total_ai_cost || 0), 0)
+
+  document.getElementById('statsRow').innerHTML = \`
+    <div class="stat-card"><div class="stat-label">Всего клиентов</div><div class="stat-value">\${total}</div></div>
+    <div class="stat-card"><div class="stat-label">Активных</div><div class="stat-value">\${active}</div></div>
+    <div class="stat-card"><div class="stat-label">Выручка</div><div class="stat-value">₽\${totalRevenue.toLocaleString('ru-RU')}</div></div>
+    <div class="stat-card"><div class="stat-label">Расход на ИИ</div><div class="stat-value">₽\${totalAiCost.toLocaleString('ru-RU', {maximumFractionDigits: 2})}</div></div>
+  \`
+
+  // Фильтр
+  let filtered = licenses
+  if (search) {
+    filtered = licenses.filter(l =>
+      (l.customer || '').toLowerCase().includes(search) ||
+      (l.key_id || '').toLowerCase().includes(search) ||
+      (l.plan || '').toLowerCase().includes(search) ||
+      (l.customer_type || '').toLowerCase().includes(search)
+    )
+  }
+
+  // Сортировка
+  const sorters = {
+    created_desc: (a, b) => new Date(b.created_at) - new Date(a.created_at),
+    created_asc: (a, b) => new Date(a.created_at) - new Date(b.created_at),
+    customer_asc: (a, b) => (a.customer || '').localeCompare(b.customer || '', 'ru'),
+    customer_desc: (a, b) => (b.customer || '').localeCompare(a.customer || '', 'ru'),
+    expiry_asc: (a, b) => {
+      const av = a.unlimited ? Infinity : (a.expiry_date ? new Date(a.expiry_date) : new Date(0))
+      const bv = b.unlimited ? Infinity : (b.expiry_date ? new Date(b.expiry_date) : new Date(0))
+      return av - bv
+    },
+    expiry_desc: (a, b) => {
+      const av = a.unlimited ? Infinity : (a.expiry_date ? new Date(a.expiry_date) : new Date(0))
+      const bv = b.unlimited ? Infinity : (b.expiry_date ? new Date(b.expiry_date) : new Date(0))
+      return bv - av
+    },
+    price_desc: (a, b) => parseFloat(b.price_rubles || 0) - parseFloat(a.price_rubles || 0),
+    price_asc: (a, b) => parseFloat(a.price_rubles || 0) - parseFloat(b.price_rubles || 0),
+    ai_cost_desc: (a, b) => parseFloat(b.total_ai_cost || 0) - parseFloat(a.total_ai_cost || 0),
+  }
+  filtered.sort(sorters[sort] || sorters.created_desc)
+
+  // Table
+  const typeLabels = { individual: 'ИП', small: 'Малая', large: 'Крупная' }
+  const planLabels = { trial: 'Trial', small: 'Small', large: 'Large', staff: 'Staff' }
+
+  document.getElementById('clientsTable').innerHTML = filtered.map(l => {
+    const isExpired = l.expiry_date && new Date(l.expiry_date) < new Date()
+    const isRevoked = l.revoked
+    const statusBadge = isRevoked
+      ? '<span class="badge badge-red">Отозвана</span>'
+      : isExpired
+      ? '<span class="badge badge-gray">Истекла</span>'
+      : l.unlimited
+      ? '<span class="badge badge-blue">Безлимит</span>'
+      : '<span class="badge badge-green">Активна</span>'
+
+    const expiryText = l.unlimited ? '∞' : (l.expiry_date ? new Date(l.expiry_date).toLocaleDateString('ru-RU') : '—')
+    const budget = parseFloat(l.ai_budget_rubles || 0)
+    const spent = parseFloat(l.total_ai_cost || 0)
+    const budgetText = budget > 0
+      ? \`₽\${spent.toLocaleString('ru-RU', {maximumFractionDigits:0})} / ₽\${budget.toLocaleString('ru-RU')}\`
+      : \`₽\${spent.toLocaleString('ru-RU', {maximumFractionDigits:0})}\`
+
+    return \`<tr>
+      <td><strong>\${escapeHtml(l.customer)}</strong><br><small style="color:#71717a">\${l.key_id}</small></td>
+      <td>\${typeLabels[l.customer_type] || '—'}</td>
+      <td><span class="badge badge-blue">\${planLabels[l.plan] || l.plan}</span></td>
+      <td>\${expiryText}</td>
+      <td>\${l.activations_count || 0}</td>
+      <td>₽\${parseFloat(l.price_rubles || 0).toLocaleString('ru-RU')}</td>
+      <td>\${budgetText}</td>
+      <td>\${budget > 0 ? renderProgress(spent, budget) : '—'}</td>
+      <td>\${statusBadge}</td>
+      <td class="row-actions">
+        <button class="btn btn-secondary btn-sm" onclick="showKey('\${l.key_id}')">Ключ</button>
+        \${!isRevoked && !l.unlimited ? \`<button class="btn btn-primary btn-sm" onclick="extendLicense('\${l.key_id}', '\${escapeHtml(l.customer)}')">Продлить</button>\` : ''}
+        \${!isRevoked ? \`<button class="btn btn-danger btn-sm" onclick="revokeLicense('\${l.key_id}')">Отозвать</button>\` : ''}
+      </td>
+    </tr>\`
+  }).join('') || '<tr><td colspan="10" style="text-align:center;color:#71717a;padding:40px;">Ничего не найдено</td></tr>'
 }
 
 function renderProgress(spent, budget) {
@@ -1037,29 +1114,57 @@ async function loadReport() {
       headers: { 'Authorization': 'Bearer ' + jwtToken }
     })
     if (resp.status === 401) { logout(); return }
-    const data = await resp.json()
-
-    const t = data.totals || {}
-    document.getElementById('reportStats').innerHTML = \`
-      <div class="stat-card"><div class="stat-label">Токенов за неделю</div><div class="stat-value">\${formatNum(t.week_total_tokens)}</div></div>
-      <div class="stat-card"><div class="stat-label">Стоимость за неделю</div><div class="stat-value">₽\${formatNum(t.week_total_cost)}</div></div>
-      <div class="stat-card"><div class="stat-label">Токенов за месяц</div><div class="stat-value">\${formatNum(t.month_total_tokens)}</div></div>
-      <div class="stat-card"><div class="stat-label">Стоимость за месяц</div><div class="stat-value">₽\${formatNum(t.month_total_cost)}</div></div>
-    \`
-
-    const rows = (data.customers || []).map(c => \`<tr>
-      <td><strong>\${escapeHtml(c.customer)}</strong></td>
-      <td>\${formatNum(c.week_tokens)}</td>
-      <td>₽\${formatNum(c.week_cost)}</td>
-      <td>\${formatNum(c.month_tokens)}</td>
-      <td>₽\${formatNum(c.month_cost)}</td>
-      <td>\${c.days_remaining !== null ? Math.round(c.days_remaining) + ' дн.' : '∞'}</td>
-    </tr>\`).join('')
-
-    document.getElementById('reportTable').innerHTML = rows || '<tr><td colspan="6" style="text-align:center;color:#71717a;padding:40px;">Нет данных</td></tr>'
+    allReportData = await resp.json()
+    renderReport()
   } catch (err) {
     document.getElementById('reportTable').innerHTML = '<tr><td colspan="6" style="color:#ef4444;">Ошибка: ' + escapeHtml(err.message) + '</td></tr>'
   }
+}
+
+function renderReport() {
+  if (!allReportData) return
+  const data = allReportData
+  const search = (document.getElementById('reportSearch')?.value || '').toLowerCase().trim()
+  const sort = document.getElementById('reportSort')?.value || 'week_cost_desc'
+
+  const t = data.totals || {}
+  document.getElementById('reportStats').innerHTML = \`
+    <div class="stat-card"><div class="stat-label">Токенов за неделю</div><div class="stat-value">\${formatNum(t.week_total_tokens)}</div></div>
+    <div class="stat-card"><div class="stat-label">Стоимость за неделю</div><div class="stat-value">₽\${formatNum(t.week_total_cost)}</div></div>
+    <div class="stat-card"><div class="stat-label">Токенов за месяц</div><div class="stat-value">\${formatNum(t.month_total_tokens)}</div></div>
+    <div class="stat-card"><div class="stat-label">Стоимость за месяц</div><div class="stat-value">₽\${formatNum(t.month_total_cost)}</div></div>
+  \`
+
+  let customers = data.customers || []
+  if (search) {
+    customers = customers.filter(c => (c.customer || '').toLowerCase().includes(search))
+  }
+
+  const sorters = {
+    week_cost_desc: (a, b) => parseFloat(b.week_cost || 0) - parseFloat(a.week_cost || 0),
+    week_cost_asc: (a, b) => parseFloat(a.week_cost || 0) - parseFloat(b.week_cost || 0),
+    month_cost_desc: (a, b) => parseFloat(b.month_cost || 0) - parseFloat(a.month_cost || 0),
+    month_cost_asc: (a, b) => parseFloat(a.month_cost || 0) - parseFloat(b.month_cost || 0),
+    week_tokens_desc: (a, b) => parseFloat(b.week_tokens || 0) - parseFloat(a.week_tokens || 0),
+    customer_asc: (a, b) => (a.customer || '').localeCompare(b.customer || '', 'ru'),
+    days_asc: (a, b) => {
+      const av = a.days_remaining === null ? Infinity : parseFloat(a.days_remaining)
+      const bv = b.days_remaining === null ? Infinity : parseFloat(b.days_remaining)
+      return av - bv
+    },
+  }
+  customers.sort(sorters[sort] || sorters.week_cost_desc)
+
+  const rows = customers.map(c => \`<tr>
+    <td><strong>\${escapeHtml(c.customer)}</strong></td>
+    <td>\${formatNum(c.week_tokens)}</td>
+    <td>₽\${formatNum(c.week_cost)}</td>
+    <td>\${formatNum(c.month_tokens)}</td>
+    <td>₽\${formatNum(c.month_cost)}</td>
+    <td>\${c.days_remaining !== null ? Math.round(c.days_remaining) + ' дн.' : '∞'}</td>
+  </tr>\`).join('')
+
+  document.getElementById('reportTable').innerHTML = rows || '<tr><td colspan="6" style="text-align:center;color:#71717a;padding:40px;">Ничего не найдено</td></tr>'
 }
 
 // ─── Utils ────────────────────────────────────────────────────────
