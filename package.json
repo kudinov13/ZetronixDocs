@@ -1,0 +1,22 @@
+{
+  "name": "zenzadocs-server",
+  "version": "1.0.0",
+  "description": "Сервер подписок и лицензирования ZenzaDocs",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "generate-keys": "node src/generate-keys.js",
+    "generate-license": "node src/generate-license.js",
+    "migrate": "node src/migrate.js",
+    "report": "node src/report.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "pg": "^8.13.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2"
+  }
+}
