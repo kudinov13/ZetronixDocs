@@ -895,14 +895,33 @@ async function generateLicense() {
   }
 }
 
+function copyToClipboard(text) {
+  // Современный API (работает на HTTPS/localhost)
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).catch(() => fallbackCopy(text))
+    return
+  }
+  fallbackCopy(text)
+}
+
+function fallbackCopy(text) {
+  const ta = document.createElement('textarea')
+  ta.value = text
+  ta.style.position = 'fixed'
+  ta.style.opacity = '0'
+  document.body.appendChild(ta)
+  ta.select()
+  try { document.execCommand('copy') } catch (e) {}
+  document.body.removeChild(ta)
+}
+
 function copyKey() {
   const key = document.getElementById('generatedKey').textContent
-  navigator.clipboard.writeText(key).then(() => {
-    const btn = event.target
-    const orig = btn.textContent
-    btn.textContent = 'Скопировано!'
-    setTimeout(() => btn.textContent = orig, 2000)
-  })
+  copyToClipboard(key)
+  const btn = event.target
+  const orig = btn.textContent
+  btn.textContent = 'Скопировано!'
+  setTimeout(() => btn.textContent = orig, 2000)
 }
 
 function resetForm() {
@@ -925,13 +944,36 @@ async function showKey(keyId) {
     const data = await resp.json()
     const lic = (data.licenses || []).find(l => l.key_id === keyId)
     if (lic) {
-      navigator.clipboard.writeText(lic.license_key).then(() => {
-        alert('Ключ скопирован в буфер обмена')
-      })
+      showKeyModal(lic.license_key, lic.customer)
+    } else {
+      alert('Ключ не найден')
     }
   } catch (err) {
     alert('Ошибка: ' + err.message)
   }
+}
+
+function showKeyModal(licenseKey, customer) {
+  const modal = document.createElement('div')
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:1000;'
+  modal.innerHTML = \`
+    <div style="background:#18181b;border:1px solid #27272a;border-radius:12px;padding:24px;max-width:700px;width:90%;max-height:80vh;overflow:auto;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+        <div>
+          <strong style="font-size:16px;">Лицензионный ключ</strong>
+          <div style="color:#71717a;font-size:13px;">\${escapeHtml(customer)}</div>
+        </div>
+        <button onclick="this.closest('div[style*=fixed]').remove()" style="background:none;border:none;color:#71717a;font-size:24px;cursor:pointer;">×</button>
+      </div>
+      <textarea id="modalKeyText" style="width:100%;height:120px;background:#0f1117;border:1px solid #3f3f46;border-radius:8px;color:#e4e4e7;padding:12px;font-family:monospace;font-size:11px;resize:vertical;" readonly>\${licenseKey}</textarea>
+      <div style="display:flex;gap:8px;margin-top:16px;">
+        <button class="btn btn-primary" onclick="copyToClipboard(document.getElementById('modalKeyText').value); this.textContent='Скопировано!'; setTimeout(() => this.textContent='Копировать', 2000)">Копировать</button>
+        <button class="btn btn-secondary" onclick="this.closest('div[style*=fixed]').remove()">Закрыть</button>
+      </div>
+    </div>
+  \`
+  document.body.appendChild(modal)
+  modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove() })
 }
 
 // ─── Revoke ───────────────────────────────────────────────────────
