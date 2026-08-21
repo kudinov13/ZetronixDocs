@@ -278,6 +278,59 @@ app.post('/api/admin/revoke', authMiddleware, async (req, res) => {
   }
 })
 
+// ─── Extend license (продление) ───────────────────────────────────
+app.post('/api/admin/extend', authMiddleware, async (req, res) => {
+  const { keyId, addDays, addPriceRubles, addAiBudgetRubles } = req.body
+  if (!keyId || !addDays) {
+    return res.status(400).json({ error: 'Укажите keyId и количество дней' })
+  }
+
+  try {
+    // Получаем текущую лицензию
+    const licResult = await pool.query(
+      'SELECT id, customer, expiry_date, unlimited, price_rubles, ai_budget_rubles, license_key FROM licenses WHERE key_id = $1',
+      [keyId]
+    )
+    if (licResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Лицензия не найдена' })
+    }
+    const lic = licResult.rows[0]
+
+    if (lic.unlimited) {
+      return res.json({ success: false, message: 'Безлимитная лицензия не требует продления' })
+    }
+
+    // Вычисляем новую дату истечения:
+    // если ещё не истекла — прибавляем к текущей дате
+    // если истекла — прибавляем от сегодня
+    const now = new Date()
+    const currentExpiry = lic.expiry_date ? new Date(lic.expiry_date) : now
+    const baseDate = currentExpiry > now ? currentExpiry : now
+    const newExpiry = new Date(baseDate)
+    newExpiry.setDate(newExpiry.getDate() + parseInt(addDays))
+
+    // Обновляем БД
+    const newPrice = parseFloat(lic.price_rubles || 0) + parseFloat(addPriceRubles || 0)
+    const newBudget = parseFloat(lic.ai_budget_rubles || 0) + parseFloat(addAiBudgetRubles || 0)
+
+    await pool.query(
+      'UPDATE licenses SET expiry_date = $1, price_rubles = $2, ai_budget_rubles = $3, revoked = FALSE WHERE key_id = $4',
+      [newExpiry, newPrice, newBudget, keyId]
+    )
+
+    res.json({
+      success: true,
+      message: `Лицензия продлена на ${addDays} дней. Новая дата: ${newExpiry.toLocaleDateString('ru-RU')}`,
+      newExpiry: newExpiry.toISOString(),
+      newPrice,
+      newBudget,
+    })
+  } catch (err) {
+    console.error('Extend error:', err)
+    res.status(500).json({ error: 'Ошибка продления: ' + err.message })
+  }
+})
+
 // ─── Generate license via admin panel ─────────────────────────────
 app.post('/api/admin/generate-license', authMiddleware, async (req, res) => {
   const {
@@ -770,6 +823,7 @@ async function loadClients() {
         <td>\${statusBadge}</td>
         <td class="row-actions">
           <button class="btn btn-secondary btn-sm" onclick="showKey('\${l.key_id}')">Ключ</button>
+          \${!isRevoked && !l.unlimited ? \`<button class="btn btn-primary btn-sm" onclick="extendLicense('\${l.key_id}', '\${escapeHtml(l.customer)}')">Продлить</button>\` : ''}
           \${!isRevoked ? \`<button class="btn btn-danger btn-sm" onclick="revokeLicense('\${l.key_id}')">Отозвать</button>\` : ''}
         </td>
       </tr>\`
@@ -884,6 +938,45 @@ async function revokeLicense(keyId) {
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + jwtToken },
       body: JSON.stringify({ keyId })
     })
+    await loadClients()
+  } catch (err) {
+    alert('Ошибка: ' + err.message)
+  }
+}
+
+// ─── Extend license (продление) ───────────────────────────────────
+function extendLicense(keyId, customer) {
+  // Модальное окно через prompt (простой вариант)
+  const days = prompt('Продление лицензии для: ' + customer + '\\n\\nНа сколько дней продлить?\\n(30 = месяц, 90 = квартал, 365 = год)', '30')
+  if (!days) return
+
+  const price = prompt('Сколько клиент заплатил за продление? (₽)\\n(0 = бесплатно)', '0')
+  if (price === null) return
+
+  const budget = prompt('Добавить бюджет на ИИ? (₽)\\n(0 = не добавлять)', '0')
+  if (budget === null) return
+
+  doExtend(keyId, parseInt(days), parseFloat(price) || 0, parseFloat(budget) || 0)
+}
+
+async function doExtend(keyId, addDays, addPrice, addBudget) {
+  try {
+    const resp = await fetch('/api/admin/extend', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + jwtToken },
+      body: JSON.stringify({
+        keyId,
+        addDays,
+        addPriceRubles: addPrice,
+        addAiBudgetRubles: addBudget,
+      })
+    })
+    const data = await resp.json()
+    if (!resp.ok) {
+      alert('Ошибка: ' + (data.error || 'неизвестная'))
+      return
+    }
+    alert(data.message)
     await loadClients()
   } catch (err) {
     alert('Ошибка: ' + err.message)
