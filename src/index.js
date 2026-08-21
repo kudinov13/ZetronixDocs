@@ -439,12 +439,18 @@ app.get('/api/admin/licenses/full', authMiddleware, async (req, res) => {
         l.price_rubles, l.ai_budget_rubles, l.admin_note,
         l.license_key, l.revoked, l.revoked_at,
         l.issued_at, l.created_at,
-        COUNT(DISTINCT a.machine_id) as activations_count,
-        MAX(a.last_seen) as last_activity,
+        COALESCE(act.activations_count, 0) as activations_count,
+        act.last_activity,
         COALESCE(usage.total_tokens, 0) as total_tokens_used,
         COALESCE(usage.total_cost, 0) as total_ai_cost
       FROM licenses l
-      LEFT JOIN activations a ON a.license_id = l.id
+      LEFT JOIN (
+        SELECT license_id,
+          COUNT(DISTINCT machine_id) as activations_count,
+          MAX(last_seen) as last_activity
+        FROM activations
+        GROUP BY license_id
+      ) act ON act.license_id = l.id
       LEFT JOIN (
         SELECT key_id,
           SUM(tokens_used) as total_tokens,
@@ -452,7 +458,6 @@ app.get('/api/admin/licenses/full', authMiddleware, async (req, res) => {
         FROM token_usage
         GROUP BY key_id
       ) usage ON usage.key_id = l.key_id
-      GROUP BY l.id
       ORDER BY l.created_at DESC
     `)
     res.json({ licenses: result.rows })
