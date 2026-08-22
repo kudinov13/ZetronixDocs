@@ -73,9 +73,8 @@ app.post('/api/license/activate', async (req, res) => {
   }
 
   try {
-    // Проверяем, существует ли лицензия и не отозвана ли
     const licResult = await pool.query(
-      'SELECT id, revoked, expiry_date, unlimited FROM licenses WHERE key_id = $1',
+      'SELECT id, revoked, expiry_date, unlimited, max_activations FROM licenses WHERE key_id = $1',
       [keyId]
     )
 
@@ -96,6 +95,32 @@ app.post('/api/license/activate', async (req, res) => {
       }
     }
 
+    // Проверяем, уже ли активировано это устройство
+    const existingAct = await pool.query(
+      'SELECT id FROM activations WHERE key_id = $1 AND machine_id = $2',
+      [keyId, machineId]
+    )
+
+    if (existingAct.rows.length === 0) {
+      // Новая активация — проверяем лимит
+      const countResult = await pool.query(
+        'SELECT COUNT(DISTINCT machine_id) as cnt FROM activations WHERE key_id = $1',
+        [keyId]
+      )
+      const currentCount = parseInt(countResult.rows[0].cnt)
+      const maxAct = license.max_activations || 1
+
+      if (currentCount >= maxAct) {
+        return res.json({
+          success: false,
+          limit_reached: true,
+          message: `Достигнут лимит активаций (${maxAct}). Обратитесь к администратору для увеличения числа пользователей.`,
+          maxActivations: maxAct,
+          currentActivations: currentCount,
+        })
+      }
+    }
+
     // Регистрируем активацию (или обновляем last_seen)
     await pool.query(`
       INSERT INTO activations (license_id, key_id, machine_id, customer, activated_at, last_seen)
@@ -107,6 +132,56 @@ app.post('/api/license/activate', async (req, res) => {
     res.json({ success: true, message: 'Активация зарегистрирована' })
   } catch (err) {
     console.error('Activation error:', err)
+    res.status(500).json({ error: 'Внутренняя ошибка сервера' })
+  }
+})
+
+// ─── License status check (для периодической проверки) ────────────
+app.post('/api/license/check', async (req, res) => {
+  const { keyId, machineId } = req.body
+
+  if (!keyId) {
+    return res.status(400).json({ error: 'Не указан keyId' })
+  }
+
+  try {
+    const licResult = await pool.query(
+      'SELECT revoked, expiry_date, unlimited, max_activations FROM licenses WHERE key_id = $1',
+      [keyId]
+    )
+
+    if (licResult.rows.length === 0) {
+      return res.json({ valid: false, reason: 'not_found' })
+    }
+
+    const license = licResult.rows[0]
+
+    if (license.revoked) {
+      return res.json({ valid: false, reason: 'revoked', message: 'Лицензия отозвана' })
+    }
+
+    if (!license.unlimited && license.expiry_date) {
+      if (new Date(license.expiry_date) < new Date()) {
+        return res.json({ valid: false, reason: 'expired', message: 'Срок действия истёк' })
+      }
+    }
+
+    // Обновляем last_seen если передан machineId
+    if (machineId) {
+      await pool.query(
+        'UPDATE activations SET last_seen = CURRENT_TIMESTAMP WHERE key_id = $1 AND machine_id = $2',
+        [keyId, machineId]
+      )
+    }
+
+    res.json({
+      valid: true,
+      unlimited: license.unlimited,
+      expiry_date: license.expiry_date,
+      max_activations: license.max_activations,
+    })
+  } catch (err) {
+    console.error('License check error:', err)
     res.status(500).json({ error: 'Внутренняя ошибка сервера' })
   }
 })
@@ -278,6 +353,81 @@ app.post('/api/admin/revoke', authMiddleware, async (req, res) => {
   }
 })
 
+// ─── Change max activations (изменение числа пользователей) ───────
+app.post('/api/admin/set-activations', authMiddleware, async (req, res) => {
+  const { keyId, maxActivations } = req.body
+  if (!keyId || maxActivations === undefined) {
+    return res.status(400).json({ error: 'Укажите keyId и maxActivations' })
+  }
+
+  const newMax = parseInt(maxActivations)
+  if (newMax < 1) {
+    return res.status(400).json({ error: 'Минимум 1 пользователь' })
+  }
+
+  try {
+    // Проверяем текущее количество активаций
+    const countResult = await pool.query(
+      'SELECT COUNT(DISTINCT machine_id) as cnt FROM activations WHERE key_id = $1',
+      [keyId]
+    )
+    const currentCount = parseInt(countResult.rows[0].cnt)
+
+    if (newMax < currentCount) {
+      return res.json({
+        success: false,
+        message: `Нельзя уменьшить до ${newMax}: уже активировано ${currentCount} устройств. Сначала отключите лишние.`,
+        currentActivations: currentCount,
+      })
+    }
+
+    await pool.query(
+      'UPDATE licenses SET max_activations = $1 WHERE key_id = $2',
+      [newMax, keyId]
+    )
+
+    res.json({
+      success: true,
+      message: `Лимит пользователей изменён на ${newMax}`,
+      maxActivations: newMax,
+    })
+  } catch (err) {
+    console.error('Set activations error:', err)
+    res.status(500).json({ error: 'Ошибка: ' + err.message })
+  }
+})
+
+// ─── List activations for a license ───────────────────────────────
+app.get('/api/admin/activations/:keyId', authMiddleware, async (req, res) => {
+  const { keyId } = req.params
+  try {
+    const result = await pool.query(
+      'SELECT machine_id, customer, activated_at, last_seen FROM activations WHERE key_id = $1 ORDER BY last_seen DESC',
+      [keyId]
+    )
+    res.json({ activations: result.rows })
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка получения активаций' })
+  }
+})
+
+// ─── Deactivate a specific device ─────────────────────────────────
+app.post('/api/admin/deactivate', authMiddleware, async (req, res) => {
+  const { keyId, machineId } = req.body
+  if (!keyId || !machineId) {
+    return res.status(400).json({ error: 'Укажите keyId и machineId' })
+  }
+  try {
+    await pool.query(
+      'DELETE FROM activations WHERE key_id = $1 AND machine_id = $2',
+      [keyId, machineId]
+    )
+    res.json({ success: true, message: 'Устройство отключено' })
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка отключения устройства' })
+  }
+})
+
 // ─── Extend license (продление) ───────────────────────────────────
 app.post('/api/admin/extend', authMiddleware, async (req, res) => {
   const { keyId, addDays, addPriceRubles, addAiBudgetRubles } = req.body
@@ -342,6 +492,7 @@ app.post('/api/admin/generate-license', authMiddleware, async (req, res) => {
     priceRubles,     // сколько клиент заплатил
     aiBudgetRubles,  // бюджет на ИИ
     adminNote,
+    maxActivations,  // лимит устройств (пользователей)
   } = req.body
 
   if (!customer) {
@@ -396,8 +547,8 @@ app.post('/api/admin/generate-license', authMiddleware, async (req, res) => {
     await pool.query(`
       INSERT INTO licenses
         (key_id, customer, plan, expiry_date, unlimited, token_limit, issued_at,
-         license_key, customer_type, price_rubles, ai_budget_rubles, admin_note)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         license_key, customer_type, price_rubles, ai_budget_rubles, admin_note, max_activations)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
     `, [
       keyId,
       customer,
@@ -411,6 +562,7 @@ app.post('/api/admin/generate-license', authMiddleware, async (req, res) => {
       parseFloat(priceRubles) || 0,
       parseFloat(aiBudgetRubles) || 0,
       adminNote || '',
+      parseInt(maxActivations) || 1,
     ])
 
     res.json({
@@ -438,7 +590,7 @@ app.get('/api/admin/licenses/full', authMiddleware, async (req, res) => {
         l.expiry_date, l.unlimited, l.token_limit,
         l.price_rubles, l.ai_budget_rubles, l.admin_note,
         l.license_key, l.revoked, l.revoked_at,
-        l.issued_at, l.created_at,
+        l.issued_at, l.created_at, l.max_activations,
         COALESCE(act.activations_count, 0) as activations_count,
         act.last_activity,
         COALESCE(usage.total_tokens, 0) as total_tokens_used,
@@ -631,6 +783,7 @@ function getAdminHtml() {
               <th>Тариф</th>
               <th>Срок</th>
               <th>Активаций</th>
+              <th>Пользователи</th>
               <th>Цена</th>
               <th>Бюджет ИИ</th>
               <th>Потрачено</th>
@@ -683,6 +836,11 @@ function getAdminHtml() {
           <label>Бюджет на ИИ (₽)</label>
           <input type="number" id="f_aiBudget" value="0" step="100" placeholder="Сколько выделяем на токены">
           <small style="color: #71717a;">0 = безлимит по тарифу</small>
+        </div>
+        <div class="form-group">
+          <label>Количество пользователей</label>
+          <input type="number" id="f_maxActivations" value="1" min="1" placeholder="Сколько ПК смогут активировать ключ">
+          <small style="color: #71717a;">Например: 4 бухгалтера = 4</small>
         </div>
         <div class="form-group full">
           <label>Примечание</label>
@@ -819,7 +977,7 @@ async function loadClients() {
     allClients = data.licenses || []
     renderClients()
   } catch (err) {
-    document.getElementById('clientsTable').innerHTML = '<tr><td colspan="10" style="color:#ef4444;">Ошибка: ' + escapeHtml(err.message) + '</td></tr>'
+    document.getElementById('clientsTable').innerHTML = '<tr><td colspan="11" style="color:#ef4444;">Ошибка: ' + escapeHtml(err.message) + '</td></tr>'
   }
 }
 
@@ -902,17 +1060,19 @@ function renderClients() {
       <td><span class="badge badge-blue">\${planLabels[l.plan] || l.plan}</span></td>
       <td>\${expiryText}</td>
       <td>\${l.activations_count || 0}</td>
+      <td>\${l.activations_count || 0} / \${l.max_activations || 1} <button class="btn btn-secondary btn-sm" style="margin-left:4px;padding:2px 8px;" onclick="changeActivations('\${l.key_id}', '\${escapeHtml(l.customer)}', \${l.max_activations || 1}, \${l.activations_count || 0})">Изменить</button></td>
       <td>₽\${parseFloat(l.price_rubles || 0).toLocaleString('ru-RU')}</td>
       <td>\${budgetText}</td>
       <td>\${budget > 0 ? renderProgress(spent, budget) : '—'}</td>
       <td>\${statusBadge}</td>
       <td class="row-actions">
         <button class="btn btn-secondary btn-sm" onclick="showKey('\${l.key_id}')">Ключ</button>
+        <button class="btn btn-secondary btn-sm" onclick="showActivations('\${l.key_id}', '\${escapeHtml(l.customer)}')">Устройства</button>
         \${!isRevoked && !l.unlimited ? \`<button class="btn btn-primary btn-sm" onclick="extendLicense('\${l.key_id}', '\${escapeHtml(l.customer)}')">Продлить</button>\` : ''}
         \${!isRevoked ? \`<button class="btn btn-danger btn-sm" onclick="revokeLicense('\${l.key_id}')">Отозвать</button>\` : ''}
       </td>
     </tr>\`
-  }).join('') || '<tr><td colspan="10" style="text-align:center;color:#71717a;padding:40px;">Ничего не найдено</td></tr>'
+  }).join('') || '<tr><td colspan="11" style="text-align:center;color:#71717a;padding:40px;">Ничего не найдено</td></tr>'
 }
 
 function renderProgress(spent, budget) {
@@ -954,6 +1114,7 @@ async function generateLicense() {
         priceRubles: document.getElementById('f_price').value,
         aiBudgetRubles: document.getElementById('f_aiBudget').value,
         adminNote: document.getElementById('f_note').value,
+        maxActivations: document.getElementById('f_maxActivations').value,
       })
     })
     const data = await resp.json()
@@ -1006,6 +1167,7 @@ function resetForm() {
   document.getElementById('f_days').value = '30'
   document.getElementById('f_price').value = '0'
   document.getElementById('f_aiBudget').value = '0'
+  document.getElementById('f_maxActivations').value = '1'
   document.getElementById('f_note').value = ''
   document.getElementById('genError').classList.add('hidden')
   document.getElementById('genSuccess').classList.add('hidden')
@@ -1069,6 +1231,101 @@ async function revokeLicense(keyId) {
 }
 
 // ─── Extend license (продление) ───────────────────────────────────
+// ─── Change activations count ─────────────────────────────────────
+function changeActivations(keyId, customer, currentMax, currentActive) {
+  const input = prompt(
+    'Изменение числа пользователей для: ' + customer + '\\n\\n' +
+    'Текущий лимит: ' + currentMax + '\\n' +
+    'Активировано: ' + currentActive + '\\n\\n' +
+    'Введите новый лимит пользователей:',
+    currentMax
+  )
+  if (input === null) return
+  const newMax = parseInt(input)
+  if (!newMax || newMax < 1) {
+    alert('Введите число больше 0')
+    return
+  }
+  doChangeActivations(keyId, newMax)
+}
+
+async function doChangeActivations(keyId, newMax) {
+  try {
+    const resp = await fetch('/api/admin/set-activations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + jwtToken },
+      body: JSON.stringify({ keyId, maxActivations: newMax })
+    })
+    const data = await resp.json()
+    if (!resp.ok || !data.success) {
+      alert(data.error || data.message || 'Ошибка')
+      return
+    }
+    alert(data.message)
+    await loadClients()
+  } catch (err) {
+    alert('Ошибка: ' + err.message)
+  }
+}
+
+// ─── Show activations (devices) ───────────────────────────────────
+async function showActivations(keyId, customer) {
+  try {
+    const resp = await fetch('/api/admin/activations/' + keyId, {
+      headers: { 'Authorization': 'Bearer ' + jwtToken }
+    })
+    const data = await resp.json()
+    const activations = data.activations || []
+
+    const rows = activations.map(a => \`<tr>
+      <td style="font-family:monospace;font-size:11px;">\${escapeHtml(a.machine_id)}</td>
+      <td>\${new Date(a.activated_at).toLocaleString('ru-RU')}</td>
+      <td>\${new Date(a.last_seen).toLocaleString('ru-RU')}</td>
+      <td><button class="btn btn-danger btn-sm" onclick="deactivateDevice('\${keyId}', '\${escapeHtml(a.machine_id)}')">Отключить</button></td>
+    </tr>\`).join('') || '<tr><td colspan="4" style="text-align:center;color:#71717a;padding:20px;">Нет активированных устройств</td></tr>'
+
+    const modal = document.createElement('div')
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:1000;'
+    modal.innerHTML = \`
+      <div style="background:#18181b;border:1px solid #27272a;border-radius:12px;padding:24px;max-width:700px;width:90%;max-height:80vh;overflow:auto;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+          <div>
+            <strong style="font-size:16px;">Устройства клиента</strong>
+            <div style="color:#71717a;font-size:13px;">\${escapeHtml(customer)} (\${activations.length} актив.)</div>
+          </div>
+          <button onclick="this.closest('div[style*=fixed]').remove()" style="background:none;border:none;color:#71717a;font-size:24px;cursor:pointer;">×</button>
+        </div>
+        <table style="width:100%;">
+          <thead><tr><th style="text-align:left;padding:8px;">Устройство</th><th style="text-align:left;padding:8px;">Активирован</th><th style="text-align:left;padding:8px;">Последняя активность</th><th></th></tr></thead>
+          <tbody>\${rows}</tbody>
+        </table>
+        <div style="margin-top:16px;display:flex;gap:8px;">
+          <button class="btn btn-secondary" onclick="this.closest('div[style*=fixed]').remove()">Закрыть</button>
+        </div>
+      </div>
+    \`
+    document.body.appendChild(modal)
+    modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove() })
+  } catch (err) {
+    alert('Ошибка: ' + err.message)
+  }
+}
+
+async function deactivateDevice(keyId, machineId) {
+  if (!confirm('Отключить устройство ' + machineId + '?\\nПользователь будет выброшен на экран активации при следующей проверке.')) return
+  try {
+    await fetch('/api/admin/deactivate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + jwtToken },
+      body: JSON.stringify({ keyId, machineId })
+    })
+    showActivations(keyId, '')
+    await loadClients()
+  } catch (err) {
+    alert('Ошибка: ' + err.message)
+  }
+}
+
 function extendLicense(keyId, customer) {
   // Модальное окно через prompt (простой вариант)
   const days = prompt('Продление лицензии для: ' + customer + '\\n\\nНа сколько дней продлить?\\n(30 = месяц, 90 = квартал, 365 = год)', '30')
