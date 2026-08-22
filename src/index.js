@@ -428,6 +428,27 @@ app.post('/api/admin/deactivate', authMiddleware, async (req, res) => {
   }
 })
 
+// ─── Delete license (полное удаление клиента из БД) ───────────────
+app.post('/api/admin/delete', authMiddleware, async (req, res) => {
+  const { keyId } = req.body
+  if (!keyId) return res.status(400).json({ error: 'Не указан keyId' })
+
+  try {
+    // Удаляем лицензию — каскадно удалятся активации и token_usage (ON DELETE CASCADE)
+    const result = await pool.query(
+      'DELETE FROM licenses WHERE key_id = $1 RETURNING customer',
+      [keyId]
+    )
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Лицензия не найдена' })
+    }
+    res.json({ success: true, message: `Клиент "${result.rows[0].customer}" удалён` })
+  } catch (err) {
+    console.error('Delete license error:', err)
+    res.status(500).json({ error: 'Ошибка удаления: ' + err.message })
+  }
+})
+
 // ─── Extend license (продление) ───────────────────────────────────
 app.post('/api/admin/extend', authMiddleware, async (req, res) => {
   const { keyId, addDays, addPriceRubles, addAiBudgetRubles } = req.body
@@ -1070,6 +1091,7 @@ function renderClients() {
         <button class="btn btn-secondary btn-sm" onclick="showActivations('\${l.key_id}', '\${escapeHtml(l.customer)}')">Устройства</button>
         \${!isRevoked && !l.unlimited ? \`<button class="btn btn-primary btn-sm" onclick="extendLicense('\${l.key_id}', '\${escapeHtml(l.customer)}')">Продлить</button>\` : ''}
         \${!isRevoked ? \`<button class="btn btn-danger btn-sm" onclick="revokeLicense('\${l.key_id}')">Отозвать</button>\` : ''}
+        <button class="btn btn-danger btn-sm" onclick="deleteClient('\${l.key_id}', '\${escapeHtml(l.customer)}')" style="background:#7f1d1d;">Удалить</button>
       </td>
     </tr>\`
   }).join('') || '<tr><td colspan="11" style="text-align:center;color:#71717a;padding:40px;">Ничего не найдено</td></tr>'
@@ -1224,6 +1246,36 @@ async function revokeLicense(keyId) {
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + jwtToken },
       body: JSON.stringify({ keyId })
     })
+    await loadClients()
+  } catch (err) {
+    alert('Ошибка: ' + err.message)
+  }
+}
+
+// ─── Delete client (полное удаление из БД) ────────────────────────
+async function deleteClient(keyId, customer) {
+  if (!confirm(
+    'УДАЛИТЬ клиента: ' + customer + '?\n\n' +
+    'Это действие НЕОБРАТИМО!\n' +
+    'Будут удалены: лицензия, все активации, вся статистика использования.\n\n' +
+    'Нажмите ОК для подтверждения.'
+  )) return
+
+  // Двойное подтверждение
+  if (!confirm('Точно удалить? Это нельзя отменить!')) return
+
+  try {
+    const resp = await fetch('/api/admin/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + jwtToken },
+      body: JSON.stringify({ keyId })
+    })
+    const data = await resp.json()
+    if (!resp.ok) {
+      alert(data.error || 'Ошибка удаления')
+      return
+    }
+    alert(data.message)
     await loadClients()
   } catch (err) {
     alert('Ошибка: ' + err.message)
