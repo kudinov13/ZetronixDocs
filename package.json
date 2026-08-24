@@ -9,6 +9,9 @@
     "generate-keys": "node src/generate-keys.js",
     "generate-license": "node src/generate-license.js",
     "migrate": "node src/migrate.js",
+    "migrate-extra": "node src/migrate-extra.js",
+    "migrate-ai-proxy": "node src/migrate-ai-proxy.js",
+    "migrate-onec": "node src/migrate-onec.js",
     "report": "node src/report.js"
   },
   "dependencies": {

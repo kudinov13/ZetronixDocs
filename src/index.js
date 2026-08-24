@@ -20,13 +20,18 @@ const path = require('path')
 const { Pool } = require('pg')
 require('dotenv').config()
 
+// AI Proxy module
+const aiProxy = require('./ai-proxy')
+// 1C Presets module
+const onecPresets = require('./onec-presets')
+
 const app = express()
 const PORT = process.env.PORT || 3000
 const JWT_SECRET = process.env.JWT_SECRET || 'change-this'
 
 // Middleware
 app.use(cors())
-app.use(express.json({ limit: '1mb' }))
+app.use(express.json({ limit: '50mb' })) // 50mb for base64 image payloads in AI proxy
 
 // PostgreSQL pool
 const pool = new Pool({
@@ -62,6 +67,199 @@ function authMiddleware(req, res, next) {
 // ─── Health check ─────────────────────────────────────────────────
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', version: '1.0.0', timestamp: new Date().toISOString() })
+})
+
+// ═══════════════════════════════════════════════════════════════════
+// AI PROXY ENDPOINTS — клиентские запросы проксируются через сервер
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── Client: register machine + get config ───
+app.post('/api/client/register', async (req, res) => {
+  const { machineId, hostname, localIp, keyId, customer } = req.body
+  if (!machineId) {
+    return res.status(400).json({ error: 'Не указан machineId' })
+  }
+  try {
+    await aiProxy.registerClientMachine(pool, { machineId, hostname, localIp, keyId, customer })
+    res.json({ success: true })
+  } catch (err) {
+    console.error('Client register error:', err)
+    res.status(500).json({ error: 'Ошибка регистрации' })
+  }
+})
+
+// ─── Client: get config (polled every 30s) ───
+app.get('/api/client/config', async (req, res) => {
+  const { machineId } = req.query
+  try {
+    const config = await aiProxy.getAllConfig(pool)
+
+    // Update last_seen
+    if (machineId) {
+      await pool.query(
+        'UPDATE client_machines SET last_seen = CURRENT_TIMESTAMP WHERE machine_id = $1',
+        [machineId]
+      )
+    }
+
+    // Get client-specific rate limit
+    let rateLimitRpm = parseInt(config.global_rate_limit_rpm) || 12
+    if (machineId) {
+      const clientLimit = await aiProxy.getClientRateLimit(pool, machineId)
+      rateLimitRpm = clientLimit
+    }
+
+    // Get active providers
+    const providersResult = await pool.query(
+      'SELECT provider FROM ai_providers WHERE is_active = TRUE'
+    )
+    const activeProviders = providersResult.rows.map(r => r.provider)
+
+    res.json({
+      ocr_provider: config.ocr_provider || 'tsar',
+      ocr_endpoint: config.ocr_endpoint || 'https://api.tsarrouter.ru/v1',
+      ocr_model: config.ocr_model || 'yandex/ocr-markdown',
+      repair_ocr_model: config.repair_ocr_model || 'deepseek-ai/DeepSeek-OCR-2',
+      gigachat_endpoint: config.gigachat_endpoint || 'https://api.giga.chat/v1',
+      gigachat_oauth_url: config.gigachat_oauth_url || 'https://ngw.devices.sberbank.ru:9443/api/v2/oauth',
+      gigachat_model: config.gigachat_model || 'GigaChat-2',
+      mistral_provider: config.mistral_provider || 'direct',
+      mistral_endpoint: config.mistral_endpoint || 'https://api.mistral.ai/v1',
+      routerai_endpoint: config.routerai_endpoint || 'https://routerai.ru/api/v1',
+      rate_limit_rpm: rateLimitRpm,
+      app_version: config.app_version || '1.0.0',
+      min_required_version: config.min_required_version || '1.0.0',
+      force_update: config.force_update === 'true',
+      update_url: config.update_url || '',
+      proxy_enabled: config.proxy_enabled !== 'false',
+      active_providers: activeProviders,
+    })
+  } catch (err) {
+    console.error('Client config error:', err)
+    res.status(500).json({ error: 'Ошибка получения конфига' })
+  }
+})
+
+// ─── Proxy: Tsar Router OCR ───
+app.post('/api/proxy/tsar/ocr', async (req, res) => {
+  await aiProxy.proxyTsarOcr(pool, req, res)
+})
+
+// ─── Proxy: GigaChat OAuth ───
+app.post('/api/proxy/gigachat/oauth', async (req, res) => {
+  await aiProxy.proxyGigachatOAuth(pool, req, res)
+})
+
+// ─── Proxy: GigaChat chat/completions ───
+app.post('/api/proxy/gigachat/chat', async (req, res) => {
+  await aiProxy.proxyGigachatChat(pool, req, res)
+})
+
+// ─── Proxy: Mistral OCR ───
+app.post('/api/proxy/mistral/ocr', async (req, res) => {
+  await aiProxy.proxyMistralOcr(pool, req, res)
+})
+
+// ─── Proxy: Mistral file upload ───
+app.post('/api/proxy/mistral/upload', async (req, res) => {
+  await aiProxy.proxyMistralUpload(pool, req, res)
+})
+
+// ─── Proxy: Mistral file delete ───
+app.post('/api/proxy/mistral/delete', async (req, res) => {
+  await aiProxy.proxyMistralDelete(pool, req, res)
+})
+
+// ─── Proxy: RouterAI ───
+app.post('/api/proxy/routerai', async (req, res) => {
+  await aiProxy.proxyRouterAi(pool, req, res)
+})
+
+// ═══════════════════════════════════════════════════════════════
+// 1C MAPPING ENDPOINTS (client-facing)
+// ═══════════════════════════════════════════════════════════════
+
+// ─── Get 1C mapping for client ───
+// Client sends keyId + config_type (detected from 1C), receives mapping JSON
+app.post('/api/client/onec-mapping', async (req, res) => {
+  const { keyId, configType, configName } = req.body
+
+  if (!keyId) {
+    return res.status(400).json({ error: 'Не указан keyId' })
+  }
+
+  try {
+    // 1. Check if client has a custom mapping in DB
+    const result = await pool.query(
+      'SELECT mapping_json, schema_json FROM onec_mappings WHERE key_id = $1 AND is_active = TRUE ORDER BY updated_at DESC LIMIT 1',
+      [keyId]
+    )
+
+    if (result.rows.length > 0) {
+      const row = result.rows[0]
+      return res.json({
+        source: 'custom',
+        mapping: JSON.parse(row.mapping_json),
+        schema: row.schema_json ? JSON.parse(row.schema_json) : null,
+      })
+    }
+
+    // 2. No custom mapping — try preset by config_type
+    const preset = onecPresets.getPreset(configType || 'custom')
+    if (preset) {
+      return res.json({
+        source: 'preset',
+        config_type: preset.config_type,
+        config_name: preset.config_name,
+        mapping: preset,
+      })
+    }
+
+    // 3. No preset — return default universal mapping
+    return res.json({
+      source: 'default',
+      mapping: {
+        config_type: 'custom',
+        config_name: configName || 'Неизвестная конфигурация',
+        document_type_mapping: {},
+        metadata_mapping: {},
+        table_mapping: {
+          tabular_section: 'Товары',
+          column_mapping: {},
+        },
+      },
+    })
+  } catch (err) {
+    console.error('1C mapping error:', err)
+    res.status(500).json({ error: 'Ошибка получения маппинга 1С' })
+  }
+})
+
+// ─── Save 1C schema from client (when client fetches /schema from their 1C) ───
+app.post('/api/client/onec-schema', async (req, res) => {
+  const { keyId, customer, configType, configName, schema } = req.body
+
+  if (!keyId || !schema) {
+    return res.status(400).json({ error: 'Не указан keyId или schema' })
+  }
+
+  try {
+    // Store schema in DB (upsert by key_id)
+    await pool.query(`
+      INSERT INTO onec_mappings (key_id, customer, config_type, config_name, schema_json, is_active, updated_at)
+      VALUES ($1, $2, $3, $4, $5, TRUE, CURRENT_TIMESTAMP)
+      ON CONFLICT (key_id) DO UPDATE SET
+        schema_json = EXCLUDED.schema_json,
+        config_type = EXCLUDED.config_type,
+        config_name = EXCLUDED.config_name,
+        updated_at = CURRENT_TIMESTAMP
+    `, [keyId, customer || '', configType || 'custom', configName || '', JSON.stringify(schema)])
+
+    res.json({ success: true, message: 'Схема 1С сохранена' })
+  } catch (err) {
+    console.error('1C schema save error:', err)
+    res.status(500).json({ error: 'Ошибка сохранения схемы' })
+  }
 })
 
 // ─── License activation ───────────────────────────────────────────
@@ -640,6 +838,210 @@ app.get('/api/admin/licenses/full', authMiddleware, async (req, res) => {
   }
 })
 
+// ═══════════════════════════════════════════════════════════════════
+// ADMIN: AI PROVIDERS MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── List all AI providers ───
+app.get('/api/admin/ai-providers', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM ai_providers ORDER BY provider, label')
+    res.json({ providers: result.rows })
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка получения списка провайдеров' })
+  }
+})
+
+// ─── Add/update AI provider key ───
+app.post('/api/admin/ai-providers', authMiddleware, async (req, res) => {
+  const { provider, label, apiKey, endpoint, isActive } = req.body
+  if (!provider || !apiKey || !endpoint) {
+    return res.status(400).json({ error: 'Укажите provider, apiKey, endpoint' })
+  }
+  try {
+    await pool.query(`
+      INSERT INTO ai_providers (provider, label, api_key, endpoint, is_active, updated_at)
+      VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+      ON CONFLICT (provider, label) DO UPDATE SET
+        api_key = EXCLUDED.api_key,
+        endpoint = EXCLUDED.endpoint,
+        is_active = EXCLUDED.is_active,
+        updated_at = CURRENT_TIMESTAMP
+    `, [provider, label || provider, apiKey, endpoint, isActive !== false])
+    res.json({ success: true, message: 'Провайдер сохранён' })
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка сохранения: ' + err.message })
+  }
+})
+
+// ─── Delete AI provider ───
+app.post('/api/admin/ai-providers/delete', authMiddleware, async (req, res) => {
+  const { id } = req.body
+  if (!id) return res.status(400).json({ error: 'Укажите id' })
+  try {
+    await pool.query('DELETE FROM ai_providers WHERE id = $1', [id])
+    res.json({ success: true, message: 'Провайдер удалён' })
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка удаления' })
+  }
+})
+
+// ═══════════════════════════════════════════════════════════════════
+// ADMIN: CLIENT MACHINES MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── List all client machines ───
+app.get('/api/admin/machines', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT m.*,
+        l.customer as license_customer,
+        l.plan as license_plan
+      FROM client_machines m
+      LEFT JOIN licenses l ON l.key_id = m.key_id
+      ORDER BY m.last_seen DESC
+    `)
+    res.json({ machines: result.rows })
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка получения списка устройств' })
+  }
+})
+
+// ─── Update machine rate limit ───
+app.post('/api/admin/machines/rate-limit', authMiddleware, async (req, res) => {
+  const { machineId, rateLimitRpm } = req.body
+  if (!machineId) return res.status(400).json({ error: 'Укажите machineId' })
+  try {
+    await pool.query(
+      'UPDATE client_machines SET rate_limit_rpm = $1 WHERE machine_id = $2',
+      [parseInt(rateLimitRpm), machineId]
+    )
+    res.json({ success: true, message: `Rate limit изменён на ${rateLimitRpm} RPM` })
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка обновления' })
+  }
+})
+
+// ─── Delete machine ───
+app.post('/api/admin/machines/delete', authMiddleware, async (req, res) => {
+  const { machineId } = req.body
+  if (!machineId) return res.status(400).json({ error: 'Укажите machineId' })
+  try {
+    await pool.query('DELETE FROM client_machines WHERE machine_id = $1', [machineId])
+    res.json({ success: true, message: 'Устройство удалено' })
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка удаления' })
+  }
+})
+
+// ═══════════════════════════════════════════════════════════════════
+// ADMIN: APP CONFIG MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── Get all config ───
+app.get('/api/admin/config', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT key, value, updated_at FROM app_config ORDER BY key')
+    const config = {}
+    for (const row of result.rows) {
+      config[row.key] = row.value
+    }
+    res.json({ config })
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка получения конфига' })
+  }
+})
+
+// ─── Update config key ───
+app.post('/api/admin/config', authMiddleware, async (req, res) => {
+  const { key, value } = req.body
+  if (!key) return res.status(400).json({ error: 'Укажите key' })
+  try {
+    await pool.query(`
+      INSERT INTO app_config (key, value, updated_at)
+      VALUES ($1, $2, CURRENT_TIMESTAMP)
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
+    `, [key, String(value)])
+    res.json({ success: true, message: `Конфиг обновлён: ${key}` })
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка обновления конфига' })
+  }
+})
+
+// ═══════════════════════════════════════════════════════════════════
+// ADMIN: 1C MAPPINGS MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── List all 1C mappings ───
+app.get('/api/admin/onec-mappings', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT m.*,
+        l.customer as license_customer
+      FROM onec_mappings m
+      LEFT JOIN licenses l ON l.key_id = m.key_id
+      ORDER BY m.updated_at DESC
+    `)
+    res.json({ mappings: result.rows })
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка получения списка маппингов' })
+  }
+})
+
+// ─── Get single 1C mapping ───
+app.get('/api/admin/onec-mappings/:id', authMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM onec_mappings WHERE id = $1', [req.params.id])
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Маппинг не найден' })
+    }
+    res.json({ mapping: result.rows[0] })
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка получения маппинга' })
+  }
+})
+
+// ─── Save/update 1C mapping ───
+app.post('/api/admin/onec-mappings', authMiddleware, async (req, res) => {
+  const { id, keyId, customer, configType, configName, mappingJson } = req.body
+  if (!keyId || !mappingJson) {
+    return res.status(400).json({ error: 'Укажите keyId и mappingJson' })
+  }
+  try {
+    const mappingStr = typeof mappingJson === 'string' ? mappingJson : JSON.stringify(mappingJson)
+    await pool.query(`
+      INSERT INTO onec_mappings (key_id, customer, config_type, config_name, mapping_json, is_active, updated_at)
+      VALUES ($1, $2, $3, $4, $5, TRUE, CURRENT_TIMESTAMP)
+      ON CONFLICT (key_id) DO UPDATE SET
+        mapping_json = EXCLUDED.mapping_json,
+        config_type = EXCLUDED.config_type,
+        config_name = EXCLUDED.config_name,
+        customer = EXCLUDED.customer,
+        updated_at = CURRENT_TIMESTAMP
+    `, [keyId, customer || '', configType || 'custom', configName || '', mappingStr])
+    res.json({ success: true, message: 'Маппинг сохранён' })
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка сохранения: ' + err.message })
+  }
+})
+
+// ─── Delete 1C mapping ───
+app.post('/api/admin/onec-mappings/delete', authMiddleware, async (req, res) => {
+  const { id } = req.body
+  if (!id) return res.status(400).json({ error: 'Укажите id' })
+  try {
+    await pool.query('DELETE FROM onec_mappings WHERE id = $1', [id])
+    res.json({ success: true, message: 'Маппинг удалён' })
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка удаления' })
+  }
+})
+
+// ─── List available presets ───
+app.get('/api/admin/onec-presets', authMiddleware, async (req, res) => {
+  res.json({ presets: onecPresets.getAllPresets() })
+})
+
 // ─── Serve admin panel HTML ───────────────────────────────────────
 app.get('/admin', (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8')
@@ -726,6 +1128,14 @@ function getAdminHtml() {
   .copy-btn:hover { text-decoration: underline; }
   .hidden { display: none; }
   .row-actions { display: flex; gap: 8px; }
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .form-group { display: flex; flex-direction: column; gap: 4px; }
+  .form-group.full { grid-column: 1 / -1; }
+  .form-group label { font-size: 12px; color: #71717a; font-weight: 500; }
+  .form-group input, .form-group select { background: #0f1117; border: 1px solid #3f3f46; border-radius: 8px; padding: 10px 12px; color: #e4e4e7; font-size: 14px; }
+  .form-group input:focus, .form-group select:focus { outline: none; border-color: #6366f1; }
+  .form-group small { font-size: 11px; color: #71717a; margin-top: 2px; }
+  .error { color: #ef4444; font-size: 14px; margin-top: 8px; }
   @media (max-width: 768px) {
     .form-grid { grid-template-columns: 1fr; }
     .stats { grid-template-columns: 1fr 1fr; }
@@ -774,6 +1184,10 @@ function getAdminHtml() {
     <div class="tab active" onclick="switchTab('clients')" id="tab-clients">Клиенты</div>
     <div class="tab" onclick="switchTab('new')" id="tab-new">Новый клиент</div>
     <div class="tab" onclick="switchTab('report')" id="tab-report">Отчёт</div>
+    <div class="tab" onclick="switchTab('ai')" id="tab-ai">AI Настройки</div>
+    <div class="tab" onclick="switchTab('devices')" id="tab-devices">Устройства</div>
+    <div class="tab" onclick="switchTab('updates')" id="tab-updates">Обновления</div>
+    <div class="tab" onclick="switchTab('onec')" id="tab-onec">1С Маппинги</div>
   </div>
 
   <!-- Tab: Clients -->
@@ -921,6 +1335,222 @@ function getAdminHtml() {
       </div>
     </div>
   </div>
+
+  <!-- Tab: AI Settings -->
+  <div id="tabContent-ai" class="hidden">
+    <div class="card">
+      <div class="card-title">API ключи провайдеров AI</div>
+      <p style="color:#a1a1aa;font-size:13px;margin-bottom:16px;">Ключи хранятся только на сервере. Клиенты получают доступ через прокси и никогда не видят ключи.</p>
+      <div style="overflow-x: auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Провайдер</th>
+              <th>Метка</th>
+              <th>Endpoint</th>
+              <th>API ключ</th>
+              <th>Активен</th>
+              <th>Действия</th>
+            </tr>
+          </thead>
+          <tbody id="aiProvidersTable"></tbody>
+        </table>
+      </div>
+      <div style="margin-top:20px;">
+        <h3 style="font-size:16px;margin-bottom:12px;">Добавить/изменить провайдера</h3>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Провайдер</label>
+            <select id="ai_provider">
+              <option value="tsar">ЦАРЬ РОУТЕР (OCR)</option>
+              <option value="gigachat">GigaChat (структурирование)</option>
+              <option value="mistral-direct">Mistral Direct (OCR)</option>
+              <option value="routerai">RouterAI (Mistral через РФ-карты)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Метка (название)</label>
+            <input type="text" id="ai_label" placeholder="Например: Основной ключ ЦАРЬ">
+          </div>
+          <div class="form-group full">
+            <label>Endpoint (URL API)</label>
+            <input type="text" id="ai_endpoint" placeholder="https://api.tsarrouter.ru/v1">
+          </div>
+          <div class="form-group full">
+            <label>API ключ</label>
+            <input type="text" id="ai_apiKey" placeholder="sk-tsar-... или другой ключ">
+          </div>
+        </div>
+        <button class="btn btn-primary" style="margin-top:16px;" onclick="saveAiProvider()">Сохранить провайдера</button>
+        <div id="aiProviderMsg" class="hidden" style="margin-top:8px;"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Глобальный конфиг AI</div>
+      <div class="form-grid">
+        <div class="form-group">
+          <label>OCR провайдер (по умолчанию)</label>
+          <select id="cfg_ocr_provider">
+            <option value="tsar">ЦАРЬ РОУТЕР</option>
+            <option value="mistral">Mistral</option>
+            <option value="google">Google Vision</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>OCR модель</label>
+          <input type="text" id="cfg_ocr_model" placeholder="yandex/ocr-markdown">
+        </div>
+        <div class="form-group">
+          <label>Repair OCR модель</label>
+          <input type="text" id="cfg_repair_ocr_model" placeholder="deepseek-ai/DeepSeek-OCR-2">
+        </div>
+        <div class="form-group">
+          <label>Mistral провайдер</label>
+          <select id="cfg_mistral_provider">
+            <option value="direct">Direct (бесплатные токены)</option>
+            <option value="routerai">RouterAI (РФ-карты)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Глобальный rate limit (RPM)</label>
+          <input type="number" id="cfg_global_rate_limit_rpm" value="12" min="1">
+        </div>
+        <div class="form-group">
+          <label>Прокси включён</label>
+          <select id="cfg_proxy_enabled">
+            <option value="true">Включён (все запросы через сервер)</option>
+            <option value="false">Выключен (клиенты используют свои ключи)</option>
+          </select>
+        </div>
+      </div>
+      <button class="btn btn-primary" style="margin-top:16px;" onclick="saveAiConfig()">Сохранить конфиг</button>
+      <div id="aiConfigMsg" class="hidden" style="margin-top:8px;"></div>
+    </div>
+  </div>
+
+  <!-- Tab: Devices -->
+  <div id="tabContent-devices" class="hidden">
+    <div class="card">
+      <div class="card-title">Клиентские устройства</div>
+      <p style="color:#a1a1aa;font-size:13px;margin-bottom:16px;">Здесь можно установить индивидуальные rate limits для каждого ПК. Идентификация по machineId + hostname + IP.</p>
+      <div class="toolbar">
+        <input type="text" class="search-box" id="deviceSearch" placeholder="Поиск по hostname, IP, machineId..." oninput="renderDevices()">
+      </div>
+      <div style="overflow-x: auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Hostname</th>
+              <th>IP</th>
+              <th>Machine ID</th>
+              <th>Клиент</th>
+              <th>Rate limit (RPM)</th>
+              <th>Последняя активность</th>
+              <th>Действия</th>
+            </tr>
+          </thead>
+          <tbody id="devicesTable"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab: Updates -->
+  <div id="tabContent-updates" class="hidden">
+    <div class="card">
+      <div class="card-title">Управление обновлениями</div>
+      <p style="color:#a1a1aa;font-size:13px;margin-bottom:16px;">При обновлении min_required_version все клиенты увидят уведомление во весь экран. При force_update — программа заблокируется до обновления.</p>
+      <div class="form-grid">
+        <div class="form-group">
+          <label>Текущая версия приложения</label>
+          <input type="text" id="cfg_app_version" placeholder="1.0.0">
+        </div>
+        <div class="form-group">
+          <label>Минимальная требуемая версия</label>
+          <input type="text" id="cfg_min_required_version" placeholder="1.0.0">
+          <small style="color:#71717a;">Клиенты с версией ниже этой увидят уведомление об обновлении</small>
+        </div>
+        <div class="form-group">
+          <label>Принудительное обновление</label>
+          <select id="cfg_force_update">
+            <option value="false">Выключено (можно отложить)</option>
+            <option value="true">Включено (блокировка до обновления)</option>
+          </select>
+        </div>
+        <div class="form-group full">
+          <label>URL для скачивания обновления</label>
+          <input type="text" id="cfg_update_url" placeholder="https://api.zetronix.ru/releases/latest.exe">
+        </div>
+      </div>
+      <button class="btn btn-primary" style="margin-top:16px;" onclick="saveUpdateConfig()">Сохранить</button>
+      <div id="updateConfigMsg" class="hidden" style="margin-top:8px;"></div>
+    </div>
+  </div>
+
+  <!-- Tab: 1C Mappings -->
+  <div id="tabContent-onec" class="hidden">
+    <div class="card">
+      <div class="card-title">Маппинги 1С по клиентам</div>
+      <p style="color:#a1a1aa;font-size:13px;margin-bottom:16px;">Для стандартных конфигураций 1С (Бухгалтерия, УТ, ERP, Комплексная) маппинг подбирается автоматически. Для кастомных — настройте вручную здесь.</p>
+      <div style="overflow-x: auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Клиент</th>
+              <th>Key ID</th>
+              <th>Тип 1С</th>
+              <th>Конфигурация</th>
+              <th>Источник</th>
+              <th>Обновлён</th>
+              <th>Действия</th>
+            </tr>
+          </thead>
+          <tbody id="onecMappingsTable"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Доступные пресеты</div>
+      <p style="color:#a1a1aa;font-size:13px;margin-bottom:16px;">Пресеты применяются автоматически при автоопределении конфигурации 1С. Просмотр — чтобы понять, какие поля маппятся.</p>
+      <div id="onecPresetsList"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Редактор маппинга</div>
+      <p style="color:#a1a1aa;font-size:13px;margin-bottom:16px;">Создать или изменить кастомный маппинг для клиента. JSON формат: { document_type_mapping, metadata_mapping, table_mapping: { tabular_section, column_mapping } }</p>
+      <div class="form-grid">
+        <div class="form-group">
+          <label>Key ID клиента</label>
+          <input type="text" id="onec_key_id" placeholder="XXXX-XXXX-XXXX-XXXX">
+        </div>
+        <div class="form-group">
+          <label>Тип конфигурации</label>
+          <select id="onec_config_type">
+            <option value="custom">custom (кастомная)</option>
+            <option value="accounting">accounting (Бухгалтерия)</option>
+            <option value="trade">trade (УТ)</option>
+            <option value="erp">erp (ERP)</option>
+            <option value="complex">complex (Комплексная)</option>
+          </select>
+        </div>
+        <div class="form-group full">
+          <label>Имя конфигурации</label>
+          <input type="text" id="onec_config_name" placeholder="1С:Бухгалтерия 8.3">
+        </div>
+        <div class="form-group full">
+          <label>JSON маппинга</label>
+          <textarea id="onec_mapping_json" rows="12" style="font-family:monospace;font-size:12px;" placeholder='{"document_type_mapping":{},"metadata_mapping":{},"table_mapping":{"tabular_section":"Товары","column_mapping":{}}}'></textarea>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:16px;">
+        <button class="btn btn-primary" onclick="saveOneCMapping()">Сохранить маппинг</button>
+        <button class="btn btn-secondary" onclick="loadPresetToEditor()">Загрузить пресет</button>
+      </div>
+      <div id="onecMappingMsg" class="hidden" style="margin-top:8px;"></div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -982,6 +1612,10 @@ function switchTab(tab) {
   document.getElementById('tab-' + tab).classList.add('active')
   if (tab === 'clients') loadClients()
   if (tab === 'report') loadReport()
+  if (tab === 'ai') loadAiProviders()
+  if (tab === 'devices') loadDevices()
+  if (tab === 'updates') loadUpdateConfig()
+  if (tab === 'onec') loadOneCMappings()
 }
 
 // ─── Load clients ─────────────────────────────────────────────────
@@ -1476,6 +2110,264 @@ function renderReport() {
   document.getElementById('reportTable').innerHTML = rows || '<tr><td colspan="6" style="text-align:center;color:#71717a;padding:40px;">Ничего не найдено</td></tr>'
 }
 
+// ─── AI Providers ─────────────────────────────────────────────────
+let allAiProviders = []
+
+async function loadAiProviders() {
+  try {
+    const resp = await fetch('/api/admin/ai-providers', {
+      headers: { 'Authorization': 'Bearer ' + jwtToken }
+    })
+    if (resp.status === 401) { logout(); return }
+    const data = await resp.json()
+    allAiProviders = data.providers || []
+    renderAiProviders()
+    await loadAiConfig()
+  } catch (err) {
+    document.getElementById('aiProvidersTable').innerHTML = '<tr><td colspan="6" style="color:#ef4444;">Ошибка: ' + escapeHtml(err.message) + '</td></tr>'
+  }
+}
+
+function renderAiProviders() {
+  const providerLabels = {
+    'tsar': 'ЦАРЬ РОУТЕР',
+    'gigachat': 'GigaChat',
+    'mistral-direct': 'Mistral Direct',
+    'routerai': 'RouterAI',
+  }
+  document.getElementById('aiProvidersTable').innerHTML = allAiProviders.map(p => {
+    const keyPreview = p.api_key ? p.api_key.substring(0, 8) + '••••••••' : '—'
+    return \`<tr>
+      <td><strong>\${providerLabels[p.provider] || p.provider}</strong></td>
+      <td>\${escapeHtml(p.label)}</td>
+      <td style="font-size:11px;color:#a1a1aa;">\${escapeHtml(p.endpoint)}</td>
+      <td style="font-family:monospace;font-size:11px;">\${keyPreview}</td>
+      <td>\${p.is_active ? '<span class="badge badge-green">Активен</span>' : '<span class="badge badge-gray">Выключен</span>'}</td>
+      <td><button class="btn btn-danger btn-sm" onclick="deleteAiProvider(\${p.id})">Удалить</button></td>
+    </tr>\`
+  }).join('') || '<tr><td colspan="6" style="text-align:center;color:#71717a;padding:20px;">Нет провайдеров. Добавьте ниже.</td></tr>'
+}
+
+async function saveAiProvider() {
+  const provider = document.getElementById('ai_provider').value
+  const label = document.getElementById('ai_label').value
+  const endpoint = document.getElementById('ai_endpoint').value
+  const apiKey = document.getElementById('ai_apiKey').value
+  const msgEl = document.getElementById('aiProviderMsg')
+
+  if (!endpoint || !apiKey) {
+    msgEl.textContent = 'Заполните endpoint и API ключ'
+    msgEl.className = 'error'
+    msgEl.classList.remove('hidden')
+    return
+  }
+
+  try {
+    const resp = await fetch('/api/admin/ai-providers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + jwtToken },
+      body: JSON.stringify({ provider, label, apiKey, endpoint, isActive: true })
+    })
+    const data = await resp.json()
+    if (!resp.ok) {
+      msgEl.textContent = data.error || 'Ошибка'
+      msgEl.className = 'error'
+      msgEl.classList.remove('hidden')
+      return
+    }
+    msgEl.textContent = 'Провайдер сохранён!'
+    msgEl.className = 'success'
+    msgEl.classList.remove('hidden')
+    document.getElementById('ai_label').value = ''
+    document.getElementById('ai_apiKey').value = ''
+    await loadAiProviders()
+  } catch (err) {
+    msgEl.textContent = 'Ошибка: ' + err.message
+    msgEl.className = 'error'
+    msgEl.classList.remove('hidden')
+  }
+}
+
+async function deleteAiProvider(id) {
+  if (!confirm('Удалить провайдера?')) return
+  try {
+    await fetch('/api/admin/ai-providers/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + jwtToken },
+      body: JSON.stringify({ id })
+    })
+    await loadAiProviders()
+  } catch (err) {
+    alert('Ошибка: ' + err.message)
+  }
+}
+
+async function loadAiConfig() {
+  try {
+    const resp = await fetch('/api/admin/config', {
+      headers: { 'Authorization': 'Bearer ' + jwtToken }
+    })
+    const data = await resp.json()
+    const cfg = data.config || {}
+    if (cfg.ocr_provider) document.getElementById('cfg_ocr_provider').value = cfg.ocr_provider
+    if (cfg.ocr_model) document.getElementById('cfg_ocr_model').value = cfg.ocr_model
+    if (cfg.repair_ocr_model) document.getElementById('cfg_repair_ocr_model').value = cfg.repair_ocr_model
+    if (cfg.mistral_provider) document.getElementById('cfg_mistral_provider').value = cfg.mistral_provider
+    if (cfg.global_rate_limit_rpm) document.getElementById('cfg_global_rate_limit_rpm').value = cfg.global_rate_limit_rpm
+    if (cfg.proxy_enabled) document.getElementById('cfg_proxy_enabled').value = cfg.proxy_enabled
+  } catch (err) {
+    console.error('Load AI config error:', err)
+  }
+}
+
+async function saveAiConfig() {
+  const msgEl = document.getElementById('aiConfigMsg')
+  const updates = [
+    ['ocr_provider', document.getElementById('cfg_ocr_provider').value],
+    ['ocr_model', document.getElementById('cfg_ocr_model').value],
+    ['repair_ocr_model', document.getElementById('cfg_repair_ocr_model').value],
+    ['mistral_provider', document.getElementById('cfg_mistral_provider').value],
+    ['global_rate_limit_rpm', document.getElementById('cfg_global_rate_limit_rpm').value],
+    ['proxy_enabled', document.getElementById('cfg_proxy_enabled').value],
+  ]
+  try {
+    for (const [key, value] of updates) {
+      await fetch('/api/admin/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + jwtToken },
+        body: JSON.stringify({ key, value })
+      })
+    }
+    msgEl.textContent = 'Конфиг сохранён! Клиенты получат обновления в течение 30 секунд.'
+    msgEl.className = 'success'
+    msgEl.classList.remove('hidden')
+  } catch (err) {
+    msgEl.textContent = 'Ошибка: ' + err.message
+    msgEl.className = 'error'
+    msgEl.classList.remove('hidden')
+  }
+}
+
+// ─── Devices ──────────────────────────────────────────────────────
+let allDevices = []
+
+async function loadDevices() {
+  try {
+    const resp = await fetch('/api/admin/machines', {
+      headers: { 'Authorization': 'Bearer ' + jwtToken }
+    })
+    if (resp.status === 401) { logout(); return }
+    const data = await resp.json()
+    allDevices = data.machines || []
+    renderDevices()
+  } catch (err) {
+    document.getElementById('devicesTable').innerHTML = '<tr><td colspan="7" style="color:#ef4444;">Ошибка: ' + escapeHtml(err.message) + '</td></tr>'
+  }
+}
+
+function renderDevices() {
+  const search = (document.getElementById('deviceSearch')?.value || '').toLowerCase().trim()
+  let filtered = allDevices
+  if (search) {
+    filtered = allDevices.filter(d =>
+      (d.hostname || '').toLowerCase().includes(search) ||
+      (d.local_ip || '').toLowerCase().includes(search) ||
+      (d.machine_id || '').toLowerCase().includes(search) ||
+      (d.customer || '').toLowerCase().includes(search)
+    )
+  }
+  document.getElementById('devicesTable').innerHTML = filtered.map(d => {
+    const lastSeen = d.last_seen ? new Date(d.last_seen).toLocaleString('ru-RU') : '—'
+    const isOnline = d.last_seen && (Date.now() - new Date(d.last_seen).getTime() < 2 * 60 * 1000)
+    return \`<tr>
+      <td><strong>\${escapeHtml(d.hostname || '—')}</strong> \${isOnline ? '<span class="badge badge-green" style="margin-left:4px;">online</span>' : ''}</td>
+      <td>\${escapeHtml(d.local_ip || '—')}</td>
+      <td style="font-family:monospace;font-size:11px;">\${escapeHtml(d.machine_id || '').substring(0, 16)}...</td>
+      <td>\${escapeHtml(d.customer || d.license_customer || '—')}</td>
+      <td>
+        <input type="number" value="\${d.rate_limit_rpm}" min="1" style="width:60px;padding:4px 8px;" onchange="updateRateLimit('\${d.machine_id}', this.value)">
+      </td>
+      <td>\${lastSeen}</td>
+      <td><button class="btn btn-danger btn-sm" onclick="deleteDevice('\${d.machine_id}')">Удалить</button></td>
+    </tr>\`
+  }).join('') || '<tr><td colspan="7" style="text-align:center;color:#71717a;padding:20px;">Нет устройств. Они появятся после первого запуска клиента.</td></tr>'
+}
+
+async function updateRateLimit(machineId, rpm) {
+  try {
+    const resp = await fetch('/api/admin/machines/rate-limit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + jwtToken },
+      body: JSON.stringify({ machineId, rateLimitRpm: parseInt(rpm) })
+    })
+    const data = await resp.json()
+    if (resp.ok && data.success) {
+      // Silent success — no alert needed
+    } else {
+      alert(data.error || 'Ошибка')
+    }
+  } catch (err) {
+    alert('Ошибка: ' + err.message)
+  }
+}
+
+async function deleteDevice(machineId) {
+  if (!confirm('Удалить устройство ' + machineId.substring(0, 16) + '?')) return
+  try {
+    await fetch('/api/admin/machines/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + jwtToken },
+      body: JSON.stringify({ machineId })
+    })
+    await loadDevices()
+  } catch (err) {
+    alert('Ошибка: ' + err.message)
+  }
+}
+
+// ─── Updates ──────────────────────────────────────────────────────
+async function loadUpdateConfig() {
+  try {
+    const resp = await fetch('/api/admin/config', {
+      headers: { 'Authorization': 'Bearer ' + jwtToken }
+    })
+    const data = await resp.json()
+    const cfg = data.config || {}
+    if (cfg.app_version) document.getElementById('cfg_app_version').value = cfg.app_version
+    if (cfg.min_required_version) document.getElementById('cfg_min_required_version').value = cfg.min_required_version
+    if (cfg.force_update) document.getElementById('cfg_force_update').value = cfg.force_update
+    if (cfg.update_url) document.getElementById('cfg_update_url').value = cfg.update_url
+  } catch (err) {
+    console.error('Load update config error:', err)
+  }
+}
+
+async function saveUpdateConfig() {
+  const msgEl = document.getElementById('updateConfigMsg')
+  const updates = [
+    ['app_version', document.getElementById('cfg_app_version').value],
+    ['min_required_version', document.getElementById('cfg_min_required_version').value],
+    ['force_update', document.getElementById('cfg_force_update').value],
+    ['update_url', document.getElementById('cfg_update_url').value],
+  ]
+  try {
+    for (const [key, value] of updates) {
+      await fetch('/api/admin/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + jwtToken },
+        body: JSON.stringify({ key, value })
+      })
+    }
+    msgEl.textContent = 'Настройки обновлений сохранены! Клиенты получат уведомление при следующем запуске.'
+    msgEl.className = 'success'
+    msgEl.classList.remove('hidden')
+  } catch (err) {
+    msgEl.textContent = 'Ошибка: ' + err.message
+    msgEl.className = 'error'
+    msgEl.classList.remove('hidden')
+  }
+}
+
 // ─── Utils ────────────────────────────────────────────────────────
 function formatNum(v) {
   if (!v || isNaN(v)) return '0'
@@ -1485,6 +2377,166 @@ function formatNum(v) {
 function escapeHtml(s) {
   if (!s) return ''
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}
+
+// ─── 1C Mappings ───────────────────────────────────────────────────
+async function loadOneCMappings() {
+  try {
+    const [mappingsResp, presetsResp] = await Promise.all([
+      fetch('/api/admin/onec-mappings', { headers: { 'Authorization': 'Bearer ' + jwtToken } }),
+      fetch('/api/admin/onec-presets', { headers: { 'Authorization': 'Bearer ' + jwtToken } })
+    ])
+    const mappingsData = await mappingsResp.json()
+    const presetsData = await presetsResp.json()
+    renderOneCMappings(mappingsData.mappings || [])
+    renderOneCPresets(presetsData.presets || {})
+  } catch (err) {
+    console.error('1C mappings load error:', err)
+  }
+}
+
+function renderOneCMappings(mappings) {
+  const tbody = document.getElementById('onecMappingsTable')
+  if (!mappings.length) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#71717a;padding:24px;">Нет сохранённых маппингов. Для стандартных 1С пресеты применяются автоматически.</td></tr>'
+    return
+  }
+  tbody.innerHTML = mappings.map(m => {
+    const source = m.mapping_json ? '<span class="badge badge-blue">кастомный</span>' : '<span class="badge badge-gray">только схема</span>'
+    const configTypeBadge = m.config_type && m.config_type !== 'custom'
+      ? '<span class="badge badge-green">' + escapeHtml(m.config_type) + '</span>'
+      : '<span class="badge badge-yellow">custom</span>'
+    return '<tr>' +
+      '<td>' + escapeHtml(m.license_customer || m.customer || '—') + '</td>' +
+      '<td style="font-family:monospace;font-size:11px;">' + escapeHtml(m.key_id || '—') + '</td>' +
+      '<td>' + configTypeBadge + '</td>' +
+      '<td>' + escapeHtml(m.config_name || '—') + '</td>' +
+      '<td>' + source + '</td>' +
+      '<td>' + escapeHtml(m.updated_at ? new Date(m.updated_at).toLocaleString('ru-RU') : '—') + '</td>' +
+      '<td class="row-actions">' +
+        '<button class="btn btn-secondary btn-sm" onclick="editOneCMapping(' + m.id + ')">Изменить</button>' +
+        '<button class="btn btn-danger btn-sm" onclick="deleteOneCMapping(' + m.id + ')">Удалить</button>' +
+      '</td>' +
+    '</tr>'
+  }).join('')
+}
+
+function renderOneCPresets(presets) {
+  const container = document.getElementById('onecPresetsList')
+  const html = Object.entries(presets).map(([key, p]) => {
+    const docTypes = Object.entries(p.document_type_mapping || {}).map(([k, v]) => escapeHtml(k) + ' → ' + escapeHtml(v)).join(', ')
+    const cols = Object.entries((p.table_mapping || {}).column_mapping || {}).map(([k, v]) => escapeHtml(k) + ' → ' + escapeHtml(v)).join(', ')
+    return '<div style="background:#0f1117;border:1px solid #3f3f46;border-radius:8px;padding:16px;margin-bottom:12px;">' +
+      '<div style="font-weight:600;color:#e4e4e7;margin-bottom:8px;">' + escapeHtml(p.config_name) + ' <span class="badge badge-gray" style="margin-left:8px;">' + escapeHtml(p.config_type) + '</span></div>' +
+      '<div style="font-size:12px;color:#a1a1aa;margin-bottom:4px;"><strong>Типы документов:</strong> ' + docTypes + '</div>' +
+      '<div style="font-size:12px;color:#a1a1aa;margin-bottom:4px;"><strong>Табличная часть:</strong> ' + escapeHtml((p.table_mapping || {}).tabular_section || '—') + '</div>' +
+      '<div style="font-size:12px;color:#a1a1aa;"><strong>Колонки:</strong> ' + cols + '</div>' +
+    '</div>'
+  }).join('')
+  container.innerHTML = html || '<p style="color:#71717a;">Пресеты не найдены</p>'
+}
+
+async function editOneCMapping(id) {
+  try {
+    const resp = await fetch('/api/admin/onec-mappings/' + id, { headers: { 'Authorization': 'Bearer ' + jwtToken } })
+    const data = await resp.json()
+    const m = data.mapping
+    if (!m) return
+    document.getElementById('onec_key_id').value = m.key_id || ''
+    document.getElementById('onec_config_type').value = m.config_type || 'custom'
+    document.getElementById('onec_config_name').value = m.config_name || ''
+    if (m.mapping_json) {
+      try {
+        const parsed = typeof m.mapping_json === 'string' ? JSON.parse(m.mapping_json) : m.mapping_json
+        document.getElementById('onec_mapping_json').value = JSON.stringify(parsed, null, 2)
+      } catch {
+        document.getElementById('onec_mapping_json').value = m.mapping_json
+      }
+    }
+  } catch (err) {
+    console.error('Edit 1C mapping error:', err)
+  }
+}
+
+async function saveOneCMapping() {
+  const keyId = document.getElementById('onec_key_id').value.trim()
+  const configType = document.getElementById('onec_config_type').value
+  const configName = document.getElementById('onec_config_name').value.trim()
+  const mappingJsonStr = document.getElementById('onec_mapping_json').value.trim()
+  const msgEl = document.getElementById('onecMappingMsg')
+
+  if (!keyId) {
+    msgEl.className = 'error'
+    msgEl.textContent = 'Укажите Key ID клиента'
+    msgEl.classList.remove('hidden')
+    return
+  }
+
+  let mappingJson
+  try {
+    mappingJson = JSON.parse(mappingJsonStr)
+  } catch {
+    msgEl.className = 'error'
+    msgEl.textContent = 'Невалидный JSON'
+    msgEl.classList.remove('hidden')
+    return
+  }
+
+  try {
+    const resp = await fetch('/api/admin/onec-mappings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + jwtToken },
+      body: JSON.stringify({ keyId, configType, configName, mappingJson })
+    })
+    const data = await resp.json()
+    if (resp.ok) {
+      msgEl.className = 'success'
+      msgEl.textContent = 'Маппинг сохранён'
+      msgEl.classList.remove('hidden')
+      loadOneCMappings()
+    } else {
+      msgEl.className = 'error'
+      msgEl.textContent = data.error || 'Ошибка сохранения'
+      msgEl.classList.remove('hidden')
+    }
+  } catch (err) {
+    msgEl.className = 'error'
+    msgEl.textContent = 'Ошибка: ' + err.message
+    msgEl.classList.remove('hidden')
+  }
+}
+
+async function deleteOneCMapping(id) {
+  if (!confirm('Удалить маппинг?')) return
+  try {
+    await fetch('/api/admin/onec-mappings/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + jwtToken },
+      body: JSON.stringify({ id })
+    })
+    loadOneCMappings()
+  } catch (err) {
+    console.error('Delete 1C mapping error:', err)
+  }
+}
+
+async function loadPresetToEditor() {
+  const configType = document.getElementById('onec_config_type').value
+  if (!configType || configType === 'custom') {
+    alert('Выберите тип конфигурации (не custom) для загрузки пресета')
+    return
+  }
+  try {
+    const resp = await fetch('/api/admin/onec-presets', { headers: { 'Authorization': 'Bearer ' + jwtToken } })
+    const data = await resp.json()
+    const preset = (data.presets || {})[configType]
+    if (preset) {
+      document.getElementById('onec_mapping_json').value = JSON.stringify(preset, null, 2)
+      document.getElementById('onec_config_name').value = preset.config_name || ''
+    }
+  } catch (err) {
+    alert('Ошибка загрузки пресета: ' + err.message)
+  }
 }
 
 // ─── Init ─────────────────────────────────────────────────────────
